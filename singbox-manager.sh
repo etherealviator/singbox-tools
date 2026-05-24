@@ -1164,6 +1164,107 @@ main_menu() {
     done
 }
 
+# ---- 批量操作 ----
+show_all_links() {
+    local ip; ip=$(get_public_ip)
+    echo
+    echo -e "${BOLD}══════ 所有节点分享链接 (v2rayN / sing-box 通用) ══════${NC}"
+    echo
+    local tags; tags=$(json_list_tags)
+    if [[ -z "$tags" ]]; then
+        print_warn "没有已配置的节点"
+        return
+    fi
+    while IFS= read -r t; do
+        local node typ port link
+        node=$(json_get_inbound "$t")
+        typ=$(echo "$node" | jq -r '.type')
+        port=$(echo "$node" | jq -r '.listen_port')
+        link=""
+        case "$typ" in
+            shadowsocks)
+                local m; m=$(echo "$node" | jq -r '.method')
+                local pw; pw=$(echo "$node" | jq -r '.password')
+                link=$(gen_ss_link "$m" "$pw" "$ip" "$port" "$t")
+                ;;
+            vmess)
+                local u; u=$(echo "$node" | jq -r '.users[0].uuid')
+                local wp; wp=$(echo "$node" | jq -r '.transport.path // "/"')
+                local tl; tl=$(echo "$node" | jq -r '.tls.enabled // false')
+                local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
+                link=$(gen_vmess_link "$u" "$ip" "$port" "ws" "$wp" "$tl" "$sn" "$t")
+                ;;
+            vless)
+                local u; u=$(echo "$node" | jq -r '.users[0].uuid')
+                local fl; fl=$(echo "$node" | jq -r '.users[0].flow // ""')
+                local wp; wp=$(echo "$node" | jq -r '.transport.path // ""')
+                local tl; tl=$(echo "$node" | jq -r 'if .tls.reality.enabled then "reality" elif .tls.enabled then "tls" else "none" end')
+                local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
+                local pbk; pbk=$(echo "$node" | jq -r '.tls.reality.handshake.server // ""')
+                local sid; sid=$(echo "$node" | jq -r '.tls.reality.short_id[0] // ""')
+                local fp="chrome"
+                link=$(gen_vless_link "$u" "$ip" "$port" "tcp" "$wp" "$tl" "$sn" "$fl" "$pbk" "$sid" "$fp" "$t")
+                ;;
+            trojan)
+                local pw; pw=$(echo "$node" | jq -r '.users[0].password')
+                local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
+                link=$(gen_trojan_link "$pw" "$ip" "$port" "$sn" "$t")
+                ;;
+            hysteria2)
+                local pw; pw=$(echo "$node" | jq -r '.users[0].password')
+                local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
+                link=$(gen_hysteria2_link "$pw" "$ip" "$port" "$sn" "$t")
+                ;;
+            tuic)
+                local u; u=$(echo "$node" | jq -r '.users[0].uuid')
+                local pw; pw=$(echo "$node" | jq -r '.users[0].password')
+                local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
+                link=$(gen_tuic_link "$u" "$pw" "$ip" "$port" "$sn" "$t")
+                ;;
+        esac
+        echo -e "${GREEN}${t}${NC}  [${typ}]  :${port}"
+        echo "  $link"
+        echo
+    done <<< "$tags"
+    echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
+}
+
+close_port() {
+    local port="$1"
+    echo
+    print_info "检查端口 $port ..."
+    local pids; pids=$(ss -tlnp | grep ":$port " | grep -oP 'pid=\K[0-9]+' | sort -u)
+    if [[ -z "$pids" ]]; then
+        print_ok "端口 $port 未被占用"
+    else
+        for pid in $pids; do
+            print_warn "关闭端口 $port (PID: $pid)"
+            kill "$pid" 2>/dev/null || true
+        done
+        print_ok "端口 $port 已关闭"
+    fi
+}
+
+purge_config() {
+    echo
+    if [[ -f "$SINGBOX_CONFIG" ]]; then
+        print_warn "备份旧配置到 ${SINGBOX_CONFIG}.bak ..."
+        cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak"
+        cat > "$SINGBOX_CONFIG" << 'CONFIG_EOF'
+{
+  "log": { "level": "info" },
+  "inbounds": [],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+CONFIG_EOF
+        print_ok "配置已清空，备份保留在 ${SINGBOX_CONFIG}.bak"
+    else
+        print_info "没有旧配置文件"
+    fi
+}
+
 # ---- 入口 ----
 main() {
     # 检查 root
@@ -1178,6 +1279,31 @@ main() {
         print_info "首次运行，安装依赖..."
         install_deps
     fi
+
+    # 命令行参数
+    case "${1:-}" in
+        --links)
+            show_all_links
+            exit 0
+            ;;
+        --close-port)
+            close_port "${2:-0}"
+            exit 0
+            ;;
+        --purge)
+            purge_config
+            exit 0
+            ;;
+        --help|-h)
+            echo "用法: sudo bash $0 [选项]"
+            echo "  (无参数)          进入交互式管理面板"
+            echo "  --links           导出所有节点的分享链接"
+            echo "  --close-port N    关闭指定端口"
+            echo "  --purge           清空配置 (备份到 .bak)"
+            echo "  --help            显示此帮助"
+            exit 0
+            ;;
+    esac
 
     # 建立快捷命令 (如果脚本路径变了则更新)
     if [[ ! -f /usr/local/bin/sb ]] || ! grep -q "$(readlink -f "$0")" /usr/local/bin/sb 2>/dev/null; then
