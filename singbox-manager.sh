@@ -980,7 +980,9 @@ view_connections() {
             [[ "$tls_type" == "false" || "$tls_type" == "null" ]] && tls_type=$(echo "$node" | jq -r '.tls.enabled // "none"')
             sni=$(echo "$node" | jq -r '.tls.server_name // ""')
             flow=$(echo "$node" | jq -r '.users[0].flow // ""')
-            pbk=$(echo "$node" | jq -r '.tls.reality.public_key // ""')
+            local priv_key; priv_key=$(echo "$node" | jq -r '.tls.reality.private_key // ""')
+            pbk=""
+            [[ -n "$priv_key" ]] && pbk=$(derive_pubkey "$priv_key")
             sid=$(echo "$node" | jq -r '.tls.reality.short_id[0] // ""')
             ws_path=$(echo "$node" | jq -r '.transport.path // ""')
             link=$(gen_vless_link "$uuid" "$ip" "$port" "tcp" "$ws_path" "$tls_type" "$sni" "$flow" "$pbk" "$sid" "chrome" "$target")
@@ -992,10 +994,14 @@ view_connections() {
             link=$(gen_trojan_link "$password" "$ip" "$port" "$sni" "$target")
             ;;
         hysteria2)
-            local password sni
+            local password sni cert
             password=$(echo "$node" | jq -r '.users[0].password')
             sni=$(echo "$node" | jq -r '.tls.server_name // ""')
-            link=$(gen_hysteria2_link "$password" "$ip" "$port" "$sni" "$target")
+            if [[ -z "$sni" ]]; then
+                cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
+                [[ -n "$cert" && -f "$cert" ]] && sni=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+            fi
+            link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$target")
             ;;
         tuic)
             local uuid password sni
@@ -1187,6 +1193,23 @@ main_menu() {
     done
 }
 
+# ---- 密钥推导 ----
+derive_pubkey() {
+    local priv="$1"
+    python3 -c "
+import base64, sys
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    priv_bytes = base64.urlsafe_b64decode(sys.argv[1] + '==')
+    priv_key = X25519PrivateKey.from_private_bytes(priv_bytes)
+    pub_bytes = priv_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(pub_bytes).decode().rstrip('='))
+except Exception as e:
+    print('', file=sys.stderr)
+" "$priv" 2>/dev/null
+}
+
 # ---- 批量操作 ----
 show_all_links() {
     local ip; ip=$(get_public_ip)
@@ -1223,7 +1246,11 @@ show_all_links() {
                 local wp; wp=$(echo "$node" | jq -r '.transport.path // ""')
                 local tl; tl=$(echo "$node" | jq -r 'if .tls.reality.enabled then "reality" elif .tls.enabled then "tls" else "none" end')
                 local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
-                local pbk; pbk=$(echo "$node" | jq -r '.tls.reality.handshake.server // ""')
+                local priv_key; priv_key=$(echo "$node" | jq -r '.tls.reality.private_key // ""')
+                local pbk=""
+                if [[ -n "$priv_key" ]]; then
+                    pbk=$(derive_pubkey "$priv_key")
+                fi
                 local sid; sid=$(echo "$node" | jq -r '.tls.reality.short_id[0] // ""')
                 local fp="chrome"
                 link=$(gen_vless_link "$u" "$ip" "$port" "tcp" "$wp" "$tl" "$sn" "$fl" "$pbk" "$sid" "$fp" "$t")
@@ -1236,7 +1263,14 @@ show_all_links() {
             hysteria2)
                 local pw; pw=$(echo "$node" | jq -r '.users[0].password')
                 local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
-                link=$(gen_hysteria2_link "$pw" "$ip" "$port" "$sn" "$t")
+                # 如果配置里没有 server_name，尝试从证书读取 CN
+                if [[ -z "$sn" ]]; then
+                    local cert; cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
+                    if [[ -n "$cert" && -f "$cert" ]]; then
+                        sn=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+                    fi
+                fi
+                link=$(gen_hysteria2_link "$pw" "$ip" "$port" "${sn:-}" "$t")
                 ;;
             tuic)
                 local u; u=$(echo "$node" | jq -r '.users[0].uuid')
