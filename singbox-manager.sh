@@ -218,8 +218,23 @@ CONFIG_EOF
     fi
 
     rm -rf "$tmpdir"
+
+    # 创建快捷命令
+    setup_alias
+
     print_ok "sing-box ${latest_ver} 安装完成"
+    echo
+    echo -e "  ${CYAN}提示: 以后直接输入 ${GREEN}sb${NC}${CYAN} 即可唤出管理面板${NC}"
     press_any_key
+}
+
+setup_alias() {
+    local script_path
+    script_path="$(readlink -f "$0")"
+    echo "#!/usr/bin/env bash" > /usr/local/bin/sb
+    echo "sudo bash '$script_path'" >> /usr/local/bin/sb
+    chmod +x /usr/local/bin/sb
+    print_ok "快捷命令已创建: sb"
 }
 
 # ---- JSON 操作 (用 jq) ----
@@ -1162,6 +1177,11 @@ main() {
         echo
         print_info "首次运行，安装依赖..."
         install_deps
+    fi
+
+    # 建立快捷命令 (如果脚本路径变了则更新)
+    if [[ ! -f /usr/local/bin/sb ]] || ! grep -q "$(readlink -f "$0")" /usr/local/bin/sb 2>/dev/null; then
+        setup_alias 2>/dev/null || true
     fi
 
     # 初始化 config (如果已安装但配置丢失)
