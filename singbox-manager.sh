@@ -1322,6 +1322,131 @@ CONFIG_EOF
     fi
 }
 
+# ---- 命令行快速添加节点 ----
+cmd_add_reality() {
+    local port="${1:-443}"
+    local dest="${2:-www.microsoft.com:443}"
+    local uuid="${3:-}"
+    [[ -z "$uuid" ]] && uuid=$("$SINGBOX_BIN" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    local tag; tag="vless-reality-$(date +%s)"
+    local server_name="${dest%:*}"
+    local dest_port="${dest##*:}"
+    local short_id; short_id=$(head -c 8 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+    local keys; keys=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null)
+    local priv_key; priv_key=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
+    local pub_key; pub_key=$(echo "$keys" | grep -oP 'PublicKey:\s*\K\S+' | head -1)
+
+    if [[ -z "$priv_key" ]]; then
+        print_err "REALITY 密钥生成失败"
+        exit 1
+    fi
+
+    print_info "添加 VLESS+REALITY 端口 $port dest=$dest ..."
+
+    local inbound_json
+    inbound_json=$(jq -n \
+        --arg type "vless" --arg tag "$tag" --arg listen "::" \
+        --arg port "$port" --arg uuid "$uuid" --arg flow "xtls-rprx-vision" \
+        --arg server "$server_name" --arg dest_port "$dest_port" --arg sni "$server_name" \
+        --arg short_id "$short_id" --arg priv_key "$priv_key" \
+        '{
+            type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
+            users: [{ uuid: $uuid, flow: $flow }],
+            tls: {
+                enabled: true, server_name: $sni,
+                reality: {
+                    enabled: true,
+                    handshake: { server: $server, server_port: ($dest_port|tonumber) },
+                    private_key: $priv_key, short_id: [$short_id]
+                }
+            }
+        }')
+    json_add_inbound "$inbound_json"
+
+    if ! "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" &>/dev/null; then
+        print_err "配置验证失败，回滚"
+        json_delete_inbound "$tag"
+        exit 1
+    fi
+
+    systemctl restart sing-box 2>/dev/null || systemctl start sing-box 2>/dev/null
+    print_ok "节点 <$tag> 添加完成"
+    echo
+    local ip; ip=$(get_public_ip)
+    local link; link=$(gen_vless_link "$uuid" "$ip" "$port" "tcp" "" "reality" "$server_name" "xtls-rprx-vision" "$pub_key" "$short_id" "chrome" "$tag")
+    qr_show "$link" "VLESS+REALITY"
+}
+
+cmd_add_hysteria2() {
+    local port="${1:-50319}"
+    local password="${2:-}"
+    local cert_dir="${3:-}"
+    [[ -z "$password" ]] && password=$(head -c 24 /dev/urandom | base64 | tr -d '=+/')
+    local tag; tag="hysteria2-$(date +%s)"
+
+    # 检测证书
+    local cert_path="" key_path="" sni=""
+    if [[ -n "$cert_dir" ]]; then
+        cert_path="$cert_dir/fullchain.pem"
+        key_path="$cert_dir/privkey.pem"
+    elif [[ -f /etc/s-box/cert.pem && -f /etc/s-box/private.key ]]; then
+        cert_path="/etc/s-box/cert.pem"
+        key_path="/etc/s-box/private.key"
+        sni=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+    elif [[ -f /etc/sing-box/certs/hy2.crt && -f /etc/sing-box/certs/hy2.key ]]; then
+        cert_path="/etc/sing-box/certs/hy2.crt"
+        key_path="/etc/sing-box/certs/hy2.key"
+    fi
+
+    print_info "添加 Hysteria2 端口 $port ..."
+
+    local inbound_json
+    if [[ -n "$cert_path" && -f "$cert_path" ]]; then
+        inbound_json=$(jq -n \
+            --arg type "hysteria2" --arg tag "$tag" --arg listen "::" \
+            --arg port "$port" --arg password "$password" \
+            --arg cert "$cert_path" --arg key "$key_path" --arg sni "${sni:-}" \
+            '{
+                type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
+                users: [{ password: $password }],
+                tls: { enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key }
+            }')
+    else
+        # 无证书模式 - 自签
+        mkdir -p /etc/sing-box/certs
+        openssl req -x509 -newkey rsa:2048 -keyout /etc/sing-box/certs/hy2.key -out /etc/sing-box/certs/hy2.crt -days 3650 -nodes -subj '/CN=sing-box' 2>/dev/null
+        cert_path="/etc/sing-box/certs/hy2.crt"
+        key_path="/etc/sing-box/certs/hy2.key"
+        sni="sing-box"
+        inbound_json=$(jq -n \
+            --arg type "hysteria2" --arg tag "$tag" --arg listen "::" \
+            --arg port "$port" --arg password "$password" \
+            --arg cert "$cert_path" --arg key "$key_path" \
+            '{
+                type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
+                users: [{ password: $password }],
+                tls: { enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key }
+            }')
+    fi
+
+    json_add_inbound "$inbound_json"
+
+    if ! "$SINGBOX_BIN" check -c "$SINGBOX_CONFIG" &>/dev/null; then
+        print_err "配置验证失败，回滚"
+        json_delete_inbound "$tag"
+        exit 1
+    fi
+
+    systemctl restart sing-box 2>/dev/null || systemctl start sing-box 2>/dev/null
+    print_ok "节点 <$tag> 添加完成"
+    echo
+    local ip; ip=$(get_public_ip)
+    local insecure="0"
+    [[ "$sni" == "sing-box" ]] && insecure="1"
+    local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$tag" | sed "s/insecure=0/insecure=$insecure/")
+    qr_show "$link" "Hysteria2"
+}
+
 # ---- 入口 ----
 main() {
     # 检查 root
@@ -1351,13 +1476,23 @@ main() {
             purge_config
             exit 0
             ;;
+        --add-reality)
+            cmd_add_reality "${2:-443}" "${3:-}" "${4:-}"
+            exit 0
+            ;;
+        --add-hysteria2)
+            cmd_add_hysteria2 "${2:-50319}" "${3:-}" "${4:-}"
+            exit 0
+            ;;
         --help|-h)
             echo "用法: sudo bash $0 [选项]"
-            echo "  (无参数)          进入交互式管理面板"
-            echo "  --links           导出所有节点的分享链接"
-            echo "  --close-port N    关闭指定端口"
-            echo "  --purge           清空配置 (备份到 .bak)"
-            echo "  --help            显示此帮助"
+            echo "  (无参数)            进入交互式管理面板"
+            echo "  --links             导出所有节点的分享链接"
+            echo "  --close-port N      关闭指定端口"
+            echo "  --purge             清空配置 (备份到 .bak)"
+            echo "  --add-reality PORT [DEST] [UUID]     快速添加 VLESS+REALITY"
+            echo "  --add-hysteria2 PORT [PASSWORD] [CERT_DIR]  快速添加 Hysteria2"
+            echo "  --help              显示此帮助"
             exit 0
             ;;
     esac
