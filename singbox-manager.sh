@@ -1441,7 +1441,13 @@ cmd_add_hysteria2() {
     print_ok "节点 <$tag> 添加完成"
     echo
     local ip; ip=$(get_public_ip)
+    # 检测自签证书 → insecure=1
     local insecure="0"
+    if [[ -n "$cert_path" && -f "$cert_path" ]]; then
+        local issuer; issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+        local subject; subject=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+        [[ "$issuer" == "$subject" ]] && insecure="1"
+    fi
     [[ "$sni" == "sing-box" ]] && insecure="1"
     local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$tag" | sed "s/insecure=0/insecure=$insecure/")
     qr_show "$link" "Hysteria2"
