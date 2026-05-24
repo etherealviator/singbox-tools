@@ -12,10 +12,33 @@ RED='\033[0;31m'    GREEN='\033[0;32m'    YELLOW='\033[1;33m'
 BLUE='\033[0;34m'   CYAN='\033[0;36m'     MAGENTA='\033[0;35m'
 BOLD='\033[1m'      NC='\033[0m'
 
-SINGBOX_CONFIG_DIR="/etc/sing-box"
-SINGBOX_CONFIG="${SINGBOX_CONFIG_DIR}/config.json"
-SINGBOX_BIN="/usr/local/bin/sing-box"
-SINGBOX_SERVICE="/etc/systemd/system/sing-box.service"
+# 自动检测或使用默认路径
+detect_singbox_paths() {
+    # 按优先级检查已知安装路径
+    if [[ -x /etc/s-box/sing-box ]]; then
+        SINGBOX_BIN="/etc/s-box/sing-box"
+        SINGBOX_CONFIG_DIR="/etc/s-box"
+        SINGBOX_CONFIG="${SINGBOX_CONFIG_DIR}/sb.json"
+    elif [[ -x /usr/local/bin/sing-box ]]; then
+        SINGBOX_BIN="/usr/local/bin/sing-box"
+        SINGBOX_CONFIG_DIR="/etc/sing-box"
+        SINGBOX_CONFIG="${SINGBOX_CONFIG_DIR}/config.json"
+    elif [[ -x /usr/bin/sing-box ]]; then
+        SINGBOX_BIN="/usr/bin/sing-box"
+        SINGBOX_CONFIG_DIR="/etc/sing-box"
+        SINGBOX_CONFIG="${SINGBOX_CONFIG_DIR}/config.json"
+    else
+        # 默认 (安装时会创建)
+        SINGBOX_BIN="/usr/local/bin/sing-box"
+        SINGBOX_CONFIG_DIR="/etc/sing-box"
+        SINGBOX_CONFIG="${SINGBOX_CONFIG_DIR}/config.json"
+    fi
+    SINGBOX_SERVICE="/etc/systemd/system/sing-box.service"
+}
+
+# 初始化路径
+detect_singbox_paths
+
 GITHUB_API="https://api.github.com/repos/Sagernet/sing-box/releases/latest"
 
 # ---- 工具函数 ----
@@ -183,7 +206,7 @@ install_singbox() {
     mkdir -p "$SINGBOX_CONFIG_DIR"
 
     if [[ ! -f "$SINGBOX_SERVICE" ]]; then
-        cat > "$SINGBOX_SERVICE" << 'SERVICE_EOF'
+        cat > "$SINGBOX_SERVICE" << SERVICE_EOF
 [Unit]
 Description=sing-box
 Documentation=https://sing-box.sagernet.org
@@ -192,7 +215,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=${SINGBOX_BIN} run -c ${SINGBOX_CONFIG}
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=1048576
