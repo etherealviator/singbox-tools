@@ -336,7 +336,7 @@ apply_config() {
 # ---- 生成随机值 ----
 gen_uuid()    { sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid; }
 gen_password() { head -c 24 /dev/urandom | base64 | tr -d "=+/"; }
-gen_shortid() { head -c 8 /dev/urandom | hexdump -v -e '1/1 "%02x"'; }
+gen_shortid() { head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n'; }
 gen_reality_keys() {
     "$SINGBOX_BIN" generate reality-keypair 2>/dev/null || {
         # fallback to openssl
@@ -1331,7 +1331,7 @@ cmd_add_reality() {
     local tag; tag="vless-reality-$(date +%s)"
     local server_name="${dest%:*}"
     local dest_port="${dest##*:}"
-    local short_id; short_id=$(head -c 8 /dev/urandom | od -A n -t x1 | tr -d ' \n')
+    local short_id; short_id=$(head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n')
     local keys; keys=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null)
     local priv_key; priv_key=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
     local pub_key; pub_key=$(echo "$keys" | grep -oP 'PublicKey:\s*\K\S+' | head -1)
