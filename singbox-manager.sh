@@ -254,8 +254,15 @@ CONFIG_EOF
 setup_alias() {
     local script_path
     script_path="$(readlink -f "$0")"
-    echo "#!/usr/bin/env bash" > /usr/local/bin/sb
-    echo "sudo bash '$script_path'" >> /usr/local/bin/sb
+    # 注意: 必须透传 "$@"，否则 sb --links 等参数会被吞
+    # root 下不再重复 sudo（脚本自身已检查 EUID），避免嵌套 sudo 警告
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "#!/usr/bin/env bash" > /usr/local/bin/sb
+        echo "bash '$script_path' \"\$@\"" >> /usr/local/bin/sb
+    else
+        echo "#!/usr/bin/env bash" > /usr/local/bin/sb
+        echo "sudo bash '$script_path' \"\$@\"" >> /usr/local/bin/sb
+    fi
     chmod +x /usr/local/bin/sb
     print_ok "快捷命令已创建: sb"
 }
@@ -264,7 +271,14 @@ setup_alias() {
 json_add_inbound() {
     local inbound_json="$1"
     local tmp; tmp=$(mktemp)
-    jq --argjson obj "$inbound_json" '.inbounds += [$obj]' "$SINGBOX_CONFIG" > "$tmp" && mv "$tmp" "$SINGBOX_CONFIG"
+    # 写前备份，避免 jq 失败写坏 config
+    cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.pre-add" 2>/dev/null || true
+    if ! jq --argjson obj "$inbound_json" '.inbounds += [$obj]' "$SINGBOX_CONFIG" > "$tmp" 2>/dev/null; then
+        print_err "JSON 写入失败，配置未修改"
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$SINGBOX_CONFIG"
 }
 
 json_delete_inbound() {
@@ -339,11 +353,18 @@ gen_password() { head -c 24 /dev/urandom | base64 | tr -d "=+/"; }
 gen_shortid() { head -c 4 /dev/urandom | od -A n -t x1 | tr -d ' \n'; }
 gen_reality_keys() {
     "$SINGBOX_BIN" generate reality-keypair 2>/dev/null || {
-        # fallback to openssl
-        local priv; priv=$(openssl genpkey -algorithm X25519 2>/dev/null | openssl pkey -text -noout 2>/dev/null | grep -A1 'priv' | tail -1 | tr -d ' :')
-        local pub; pub=$(openssl pkey -pubout -in <(echo "$priv") 2>/dev/null | openssl pkey -pubin -text -noout | grep -A1 'pub' | tail -1 | tr -d ' :')
-        echo "privateKey: $priv"
-        echo "publicKey: $pub"
+        # fallback to openssl (X25519)
+        local tmp; tmp=$(mktemp)
+        openssl genpkey -algorithm X25519 -out "$tmp" 2>/dev/null
+        local priv
+        priv=$(openssl pkey -in "$tmp" -text -noout 2>/dev/null | awk '/priv:/{getline; print $1}' | tr -d ':' || true)
+        local pub
+        pub=$(openssl pkey -in "$tmp" -pubout -outform DER 2>/dev/null | openssl pkey -pubin -inform DER -text -noout 2>/dev/null | awk '/pub:/{getline; print $1}' | tr -d ':' || true)
+        rm -f "$tmp"
+        if [[ -n "$priv" && -n "$pub" ]]; then
+            echo "privateKey: $priv"
+            echo "publicKey: $pub"
+        fi
     }
 }
 
@@ -356,7 +377,7 @@ get_public_ip() {
 gen_ss_link() {
     local method="$1" password="$2" host="$3" port="$4" tag="$5"
     local b64; b64=$(echo -n "${method}:${password}" | base64 -w0)
-    echo "ss://${b64}@${host}:${port}#${tag}"
+    echo "ss://${b64}@${host}:${port}#$(urlencode "$tag")"
 }
 
 gen_vmess_link() {
@@ -371,37 +392,38 @@ gen_vless_link() {
     local uuid="$1" host="$2" port="$3" net="$4" path="$5" tls="$6" sni="$7" flow="$8" pbk="$9" sid="${10}" fp="${11}" tag="${12}"
     local params="type=${net}&security=${tls}"
     [[ -n "$sni" ]] && params+="&sni=${sni}"
-    [[ -n "$path" ]] && params+="&path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$path'))" 2>/dev/null || echo "$path")"
+    [[ -n "$path" ]] && params+="&path=$(urlencode "$path")"
     [[ -n "$flow" ]] && params+="&flow=${flow}"
     [[ -n "$pbk" ]] && params+="&pbk=${pbk}"
     [[ -n "$sid" ]] && params+="&sid=${sid}"
     [[ -n "$fp" ]] && params+="&fp=${fp}"
-    echo "vless://${uuid}@${host}:${port}?${params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('$tag'))" 2>/dev/null || echo "$tag")"
+    echo "vless://${uuid}@${host}:${port}?${params}#$(urlencode "$tag")"
 }
 
 gen_trojan_link() {
     local password="$1" host="$2" port="$3" sni="$4" tag="$5"
-    echo "trojan://${password}@${host}:${port}?security=tls&sni=${sni}&type=tcp#$(python3 -c "import urllib.parse; print(urllib.parse.quote('$tag'))" 2>/dev/null || echo "$tag")"
+    echo "trojan://${password}@${host}:${port}?security=tls&sni=${sni}&type=tcp#$(urlencode "$tag")"
 }
 
 gen_hysteria2_link() {
-    local password="$1" host="$2" port="$3" sni="$4" tag="$5"
-    local params="insecure=0"
+    local password="$1" host="$2" port="$3" sni="$4" tag="$5" insecure="${6:-0}"
+    local params="insecure=${insecure}"
     [[ -n "$sni" ]] && params+="&sni=${sni}"
-    echo "hysteria2://${password}@${host}:${port}?${params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('$tag'))" 2>/dev/null || echo "$tag")"
+    echo "hysteria2://${password}@${host}:${port}?${params}#$(urlencode "$tag")"
 }
 
 gen_tuic_link() {
-    local uuid="$1" password="$2" host="$3" port="$4" sni="$5" tag="$6"
+    local uuid="$1" password="$2" host="$3" port="$4" sni="$5" tag="$6" insecure="${7:-0}"
     local params="congestion_control=bbr&udp_relay_mode=native&alpn=h3"
     [[ -n "$sni" ]] && params+="&sni=${sni}"
-    echo "tuic://${uuid}:${password}@${host}:${port}?${params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('$tag'))" 2>/dev/null || echo "$tag")"
+    [[ "$insecure" == "1" ]] && params+="&insecure=1"
+    echo "tuic://${uuid}:${password}@${host}:${port}?${params}#$(urlencode "$tag")"
 }
 
-# URL 编码
+# URL 编码 (用环境变量传值，避免 shell 引号注入)
 urlencode() {
     local str="$*"
-    python3 -c "import urllib.parse; print(urllib.parse.quote('$str'))" 2>/dev/null || echo "$str"
+    URLENCODE_STR="$str" python3 -c "import os, urllib.parse; print(urllib.parse.quote(os.environ['URLENCODE_STR']))" 2>/dev/null || echo "$str"
 }
 
 # 生成二维码 (终端内)
@@ -637,34 +659,47 @@ add_hysteria2() {
 
     echo
     echo "  模式:"
-    echo "    a) 不带 TLS (端口跳跃模式，简单)"
-    echo "    b) 带 TLS (需要域名+证书，更安全)"
+    echo "    a) 自签证书 (简单，免域名)"
+    echo "    b) 域名证书 (需要域名+证书，更安全)"
     local mode_choice; read -r -p "  选择 [a]: " mode_choice
     mode_choice="${mode_choice:-a}"
 
     local password; password=$(input "密码 (留空自动生成)" "$(gen_password)")
 
-    local inbound_json domain="" cert_path="" key_path=""
+    local inbound_json domain="" cert_path="" key_path="" sni=""
     if [[ "$mode_choice" == "b" ]]; then
         domain=$(input_required "TLS 域名")
         cert_path=$(input "TLS 证书路径" "/etc/ssl/certs/${domain}.pem")
         key_path=$(input "TLS 私钥路径" "/etc/ssl/private/${domain}.key")
+        sni="$domain"
+        if [[ ! -f "$cert_path" ]]; then
+            print_warn "证书文件 $cert_path 不存在，请确认路径正确"
+            if ! confirm "继续添加?"; then return; fi
+        fi
         inbound_json=$(jq -n \
             --arg type "hysteria2" --arg tag "$tag" --arg listen "::" \
             --arg port "$port" --arg password "$password" \
-            --arg cert "$cert_path" --arg key "$key_path" --arg sni "$domain" \
+            --arg cert "$cert_path" --arg key "$key_path" --arg sni "$sni" \
             '{
                 type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
                 users: [{ password: $password }],
-                tls: { enabled: true, server_name: $sni, certificate_path: $cert, key_path: $key }
+                tls: { enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key }
             }')
     else
+        # 自签证书模式 (hysteria2 强制要求 TLS，不能无 TLS)
+        mkdir -p /etc/sing-box/certs
+        openssl req -x509 -newkey rsa:2048 -keyout /etc/sing-box/certs/hy2.key -out /etc/sing-box/certs/hy2.crt -days 3650 -nodes -subj '/CN=sing-box' 2>/dev/null
+        cert_path="/etc/sing-box/certs/hy2.crt"
+        key_path="/etc/sing-box/certs/hy2.key"
+        sni="sing-box"
         inbound_json=$(jq -n \
             --arg type "hysteria2" --arg tag "$tag" --arg listen "::" \
             --arg port "$port" --arg password "$password" \
+            --arg cert "$cert_path" --arg key "$key_path" \
             '{
                 type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
-                users: [{ password: $password }]
+                users: [{ password: $password }],
+                tls: { enabled: true, server_name: "sing-box", alpn: ["h3"], certificate_path: $cert, key_path: $key }
             }')
     fi
 
@@ -673,7 +708,9 @@ add_hysteria2() {
     apply_config "$tag"
 
     local ip; ip=$(get_public_ip)
-    local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "${domain:-}" "$tag")
+    local insecure="0"
+    [[ "$sni" == "sing-box" ]] && insecure="1"
+    local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$tag" "$insecure")
     echo
     print_ok "节点 <$tag> 添加完成"
     qr_show "$link" "Hysteria2"
@@ -689,33 +726,46 @@ add_tuic() {
 
     echo
     echo "  模式:"
-    echo "    a) 不带 TLS (简单)"
-    echo "    b) 带 TLS (需要域名+证书)"
+    echo "    a) 自签证书 (简单，免域名)"
+    echo "    b) 域名证书 (需要域名+证书)"
     local mode_choice; read -r -p "  选择 [a]: " mode_choice
     mode_choice="${mode_choice:-a}"
 
-    local inbound_json domain="" cert_path="" key_path=""
+    local inbound_json domain="" cert_path="" key_path="" sni=""
     if [[ "$mode_choice" == "b" ]]; then
         domain=$(input_required "TLS 域名")
         cert_path=$(input "TLS 证书路径" "/etc/ssl/certs/${domain}.pem")
         key_path=$(input "TLS 私钥路径" "/etc/ssl/private/${domain}.key")
+        sni="$domain"
+        if [[ ! -f "$cert_path" ]]; then
+            print_warn "证书文件 $cert_path 不存在，请确认路径正确"
+            if ! confirm "继续添加?"; then return; fi
+        fi
         inbound_json=$(jq -n \
             --arg type "tuic" --arg tag "$tag" --arg listen "::" \
             --arg port "$port" --arg uuid "$uuid" --arg password "$password" \
-            --arg cert "$cert_path" --arg key "$key_path" --arg sni "$domain" \
+            --arg cert "$cert_path" --arg key "$key_path" --arg sni "$sni" \
             '{
                 type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
                 users: [{ uuid: $uuid, password: $password }],
-                tls: { enabled: true, server_name: $sni, certificate_path: $cert, key_path: $key },
+                tls: { enabled: true, server_name: $sni, alpn: ["h3"], certificate_path: $cert, key_path: $key },
                 congestion_control: "bbr"
             }')
     else
+        # 自签证书模式 (TUIC 强制要求 TLS)
+        mkdir -p /etc/sing-box/certs
+        openssl req -x509 -newkey rsa:2048 -keyout /etc/sing-box/certs/tuic.key -out /etc/sing-box/certs/tuic.crt -days 3650 -nodes -subj '/CN=sing-box' 2>/dev/null
+        cert_path="/etc/sing-box/certs/tuic.crt"
+        key_path="/etc/sing-box/certs/tuic.key"
+        sni="sing-box"
         inbound_json=$(jq -n \
             --arg type "tuic" --arg tag "$tag" --arg listen "::" \
             --arg port "$port" --arg uuid "$uuid" --arg password "$password" \
+            --arg cert "$cert_path" --arg key "$key_path" \
             '{
                 type: $type, tag: $tag, listen: $listen, listen_port: ($port|tonumber),
                 users: [{ uuid: $uuid, password: $password }],
+                tls: { enabled: true, server_name: "sing-box", alpn: ["h3"], certificate_path: $cert, key_path: $key },
                 congestion_control: "bbr"
             }')
     fi
@@ -725,7 +775,10 @@ add_tuic() {
     apply_config "$tag"
 
     local ip; ip=$(get_public_ip)
-    local link; link=$(gen_tuic_link "$uuid" "$password" "$ip" "$port" "${domain:-}" "$tag")
+    local insecure="0"
+    [[ "$sni" == "sing-box" ]] && insecure="1"
+    local link; link=$(gen_tuic_link "$uuid" "$password" "$ip" "$port" "${sni:-}" "$tag")
+    [[ "$insecure" == "1" ]] && link="${link}&insecure=1"
     echo
     print_ok "节点 <$tag> 添加完成"
     qr_show "$link" "TUIC"
@@ -997,18 +1050,24 @@ view_connections() {
             local password sni cert
             password=$(echo "$node" | jq -r '.users[0].password')
             sni=$(echo "$node" | jq -r '.tls.server_name // ""')
-            if [[ -z "$sni" ]]; then
-                cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
-                [[ -n "$cert" && -f "$cert" ]] && sni=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+            local hy_ins="0"
+            if [[ -z "$sni" || "$sni" == "sing-box" ]]; then
+                hy_ins="1"
+                if [[ -z "$sni" ]]; then
+                    cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
+                    [[ -n "$cert" && -f "$cert" ]] && sni=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+                fi
             fi
-            link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$target")
+            link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$target" "$hy_ins")
             ;;
         tuic)
             local uuid password sni
             uuid=$(echo "$node" | jq -r '.users[0].uuid')
             password=$(echo "$node" | jq -r '.users[0].password')
             sni=$(echo "$node" | jq -r '.tls.server_name // ""')
-            link=$(gen_tuic_link "$uuid" "$password" "$ip" "$port" "$sni" "$target")
+            local tc_ins="0"
+            [[ -z "$sni" || "$sni" == "sing-box" ]] && tc_ins="1"
+            link=$(gen_tuic_link "$uuid" "$password" "$ip" "$port" "$sni" "$target" "$tc_ins")
             ;;
     esac
 
@@ -1263,20 +1322,26 @@ show_all_links() {
             hysteria2)
                 local pw; pw=$(echo "$node" | jq -r '.users[0].password')
                 local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
-                # 如果配置里没有 server_name，尝试从证书读取 CN
-                if [[ -z "$sn" ]]; then
-                    local cert; cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
-                    if [[ -n "$cert" && -f "$cert" ]]; then
-                        sn=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+                local hy_ins="0"
+                # 自签证书 (无 server_name 或 CN=sing-box) → insecure=1
+                if [[ -z "$sn" || "$sn" == "sing-box" ]]; then
+                    hy_ins="1"
+                    if [[ -z "$sn" ]]; then
+                        local cert; cert=$(echo "$node" | jq -r '.tls.certificate_path // ""')
+                        if [[ -n "$cert" && -f "$cert" ]]; then
+                            sn=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^/\n]+' | head -1)
+                        fi
                     fi
                 fi
-                link=$(gen_hysteria2_link "$pw" "$ip" "$port" "${sn:-}" "$t")
+                link=$(gen_hysteria2_link "$pw" "$ip" "$port" "${sn:-}" "$t" "$hy_ins")
                 ;;
             tuic)
                 local u; u=$(echo "$node" | jq -r '.users[0].uuid')
                 local pw; pw=$(echo "$node" | jq -r '.users[0].password')
                 local sn; sn=$(echo "$node" | jq -r '.tls.server_name // ""')
-                link=$(gen_tuic_link "$u" "$pw" "$ip" "$port" "$sn" "$t")
+                local tc_ins="0"
+                [[ -z "$sn" || "$sn" == "sing-box" ]] && tc_ins="1"
+                link=$(gen_tuic_link "$u" "$pw" "$ip" "$port" "$sn" "$t" "$tc_ins")
                 ;;
         esac
         echo -e "${GREEN}${t}${NC}  [${typ}]  :${port}"
@@ -1290,7 +1355,12 @@ close_port() {
     local port="$1"
     echo
     print_info "检查端口 $port ..."
-    local pids; pids=$(ss -tlnp | grep ":$port " | grep -oP 'pid=\K[0-9]+' | sort -u)
+    # 同时检查 TCP 和 UDP；端口为纯数字，先做格式校验避免正则注入
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then
+        print_err "无效端口: $port"
+        return 1
+    fi
+    local pids; pids=$(ss -tulnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | sort -u)
     if [[ -z "$pids" ]]; then
         print_ok "端口 $port 未被占用"
     else
@@ -1369,7 +1439,11 @@ cmd_add_reality() {
         exit 1
     fi
 
-    systemctl restart sing-box 2>/dev/null || systemctl start sing-box 2>/dev/null
+    if is_running; then
+        systemctl restart sing-box
+    else
+        systemctl start sing-box 2>/dev/null || true
+    fi
     print_ok "节点 <$tag> 添加完成"
     echo
     local ip; ip=$(get_public_ip)
@@ -1449,7 +1523,10 @@ cmd_add_hysteria2() {
         [[ "$issuer" == "$subject" ]] && insecure="1"
     fi
     [[ "$sni" == "sing-box" ]] && insecure="1"
-    local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "${sni:-}" "$tag" | sed "s/insecure=0/insecure=$insecure/")
+    # 自签证书时链接显式带 sni=sing-box，客户端兼容性更好
+    local link_sni="${sni:-}"
+    [[ "$insecure" == "1" && -z "$link_sni" ]] && link_sni="sing-box"
+    local link; link=$(gen_hysteria2_link "$password" "$ip" "$port" "$link_sni" "$tag" "$insecure")
     qr_show "$link" "Hysteria2"
 }
 
@@ -1494,11 +1571,16 @@ main() {
             echo "用法: sudo bash $0 [选项]"
             echo "  (无参数)            进入交互式管理面板"
             echo "  --links             导出所有节点的分享链接"
-            echo "  --close-port N      关闭指定端口"
+            echo "  --close-port N      关闭指定端口 (TCP/UDP)"
             echo "  --purge             清空配置 (备份到 .bak)"
             echo "  --add-reality PORT [DEST] [UUID]     快速添加 VLESS+REALITY"
             echo "  --add-hysteria2 PORT [PASSWORD] [CERT_DIR]  快速添加 Hysteria2"
+            echo "  --version           显示版本"
             echo "  --help              显示此帮助"
+            exit 0
+            ;;
+        --version)
+            echo "singbox-manager v1.0"
             exit 0
             ;;
     esac
